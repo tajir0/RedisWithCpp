@@ -2,7 +2,7 @@
 #include <stdint.h>
 #include "heap.h"
 
-
+//最小堆
 static size_t heap_parent(size_t i) {
     return (i + 1) / 2 - 1;
 }

@@ -14,14 +14,18 @@
 #include <netinet/ip.h>
 #include <string>
 #include <vector>
-// proj
-#include "src/hashtable.h"
-#include "src/zset.h"
-#include "src/list.h"
-#include "src/heap.h"
-#include "src/thread_pool.h"
-#include "src/common.h"
+#include <memory> // 引入智能指针
+#include <iostream> 
 
+// proj
+#include "data_structure/hashtable.h"
+#include "data_structure/zset.h"
+#include "data_structure/list.h"
+#include "data_structure/heap.h"
+#include "src/thread_pool.h"
+#include "data_structure/common.h"
+
+//全局变量
 
 static void msg(const char *msg) {
     fprintf(stderr, "%s\n", msg);
@@ -58,14 +62,14 @@ static void fd_set_nb(int fd) {
 
 struct Conn;
 
-// global variables
+// 全局结构体，用于存储哈希表、客户端连接映射、空闲连接列表、堆和线程池。
 static struct {
     HMap db;
     // a map of all client connections, keyed by fd
-    std::vector<Conn *> fd2conn;
+    std::vector<std::unique_ptr<Conn> > fd2conn; // 使用智能指针
     // timers for idle connections
     DList idle_list;
-    // timers for TTLs
+    // 最小堆实现 TTLs
     std::vector<HeapItem> heap;
     // the thread pool
     TheadPool tp;
@@ -73,12 +77,14 @@ static struct {
 
 const size_t k_max_msg = 4096;
 
+//定义连接的状态，便于管理连接的生命周期
 enum {
     STATE_REQ = 0,
     STATE_RES = 1,
     STATE_END = 2,  // mark the connection for deletion
 };
 
+//定义一个连接的状态，包括文件描述符、状态、读写缓冲区、空闲时间
 struct Conn {
     int fd = -1;
     uint32_t state = 0;     // either STATE_REQ or STATE_RES
@@ -94,11 +100,11 @@ struct Conn {
     DList idle_list;
 };
 
-static void conn_put(std::vector<Conn *> &fd2conn, struct Conn *conn) {
-    if (fd2conn.size() <= (size_t)conn->fd) {
+static void conn_put(std::vector<std::unique_ptr<Conn> >& fd2conn, std::unique_ptr<Conn>& conn) {
+    if (fd2conn.size() <= static_cast<size_t>(conn->fd)) {
         fd2conn.resize(conn->fd + 1);
     }
-    fd2conn[conn->fd] = conn;
+    fd2conn[conn->fd] = std::move(conn); 
 }
 
 static int32_t accept_new_conn(int fd) {
@@ -113,19 +119,23 @@ static int32_t accept_new_conn(int fd) {
 
     // set the new connection fd to nonblocking mode
     fd_set_nb(connfd);
-    // creating the struct Conn
-    struct Conn *conn = (struct Conn *)malloc(sizeof(struct Conn));
-    if (!conn) {
-        close(connfd);
-        return -1;
-    }
+    //  创建连接结构体
+    auto conn = std::make_unique<Conn>();
+    // if (!conn) {
+    //     close(connfd);
+    //     return -1;
+    // }
+    //初始化连接状态
     conn->fd = connfd;
-    conn->state = STATE_REQ;
+    conn->state = STATE_REQ; //请求状态
     conn->rbuf_size = 0;
     conn->wbuf_size = 0;
     conn->wbuf_sent = 0;
+    //记录连接的空闲开始时间，使用 get_monotonic_usec 获取当前时间
     conn->idle_start = get_monotonic_usec();
+    //将新连接的 idle_list 节点插入到全局空闲连接列表 g_data.idle_list 中，以便管理空闲连接。
     dlist_insert_before(&g_data.idle_list, &conn->idle_list);
+    //存储连接
     conn_put(g_data.fd2conn, conn);
     return 0;
 }
@@ -183,6 +193,7 @@ struct Entry {
     size_t heap_idx = -1;
 };
 
+//通过比较节点的哈希码和对应条目的键来判断相等性
 static bool entry_eq(HNode *lhs, HNode *rhs) {
     struct Entry *le = container_of(lhs, struct Entry, node);
     struct Entry *re = container_of(rhs, struct Entry, node);
@@ -279,16 +290,28 @@ static void do_set(std::vector<std::string> &cmd, std::string &out) {
 }
 
 // set or remove the TTL
+/**
+ * @brief 设置或移除条目的 TTL（生存时间）。
+ *
+ * 该函数根据传入的 TTL 值设置或移除条目的过期时间。
+ * 如果 TTL 值为负，则从堆中移除该条目；如果为非负值，则设置条目的过期时间。
+ *
+ * @param ent 指向要设置或移除 TTL 的条目的指针。该条目应为有效的 Entry 结构体。
+ * @param ttl_ms 要设置的 TTL 值，以毫秒为单位。
+ *               - 如果值为负，表示移除条目的 TTL。
+ *               - 如果值为 0 或正数，表示设置条目的 TTL。
+ */
 static void entry_set_ttl(Entry *ent, int64_t ttl_ms) {
     if (ttl_ms < 0 && ent->heap_idx != (size_t)-1) {
-        // erase an item from the heap
-        // by replacing it with the last item in the array.
+        // 从堆中移除条目
+        // 将堆中最后一个条目替换到 pos 位置，以保持堆（数组）的完整性。
         size_t pos = ent->heap_idx;
         g_data.heap[pos] = g_data.heap.back();
         g_data.heap.pop_back();
         if (pos < g_data.heap.size()) {
             heap_update(g_data.heap.data(), pos, g_data.heap.size());
         }
+        //表示该条目不再在堆中
         ent->heap_idx = -1;
     } else if (ttl_ms >= 0) {
         size_t pos = ent->heap_idx;
@@ -299,6 +322,7 @@ static void entry_set_ttl(Entry *ent, int64_t ttl_ms) {
             g_data.heap.push_back(item);
             pos = g_data.heap.size() - 1;
         }
+        //设置过期时间：当前时间（以微秒为单位）加上 TTL（转换为微秒）
         g_data.heap[pos].val = get_monotonic_usec() + (uint64_t)ttl_ms * 1000;
         heap_update(g_data.heap.data(), pos, g_data.heap.size());
     }
@@ -310,6 +334,21 @@ static bool str2int(const std::string &s, int64_t &out) {
     return endp == s.c_str() + s.size();
 }
 
+/**
+ * @brief 设置条目的 TTL（生存时间）或移除其过期时间。
+ *
+ * 该函数根据命令中的参数设置条目的 TTL。如果 TTL 值为负，则表示移除条目的 TTL。
+ * 如果 TTL 值为非负，则设置条目的过期时间。
+ *
+ * @param cmd 包含命令及其参数的字符串向量。预期格式为：
+ *            - cmd[1]：要设置 TTL 的条目的键。
+ *            - cmd[2]：要设置的 TTL 值，以毫秒为单位（可以为负值以移除 TTL）。
+ * @param out 用于存储输出结果的字符串。函数将结果写入此字符串。
+ *
+ * @return 无返回值。通过 `out` 参数返回操作结果。
+ *         - 如果成功设置或移除 TTL，返回 1。
+ *         - 如果参数转换失败，返回错误信息。
+ */
 static void do_expire(std::vector<std::string> &cmd, std::string &out) {
     int64_t ttl_ms = 0;
     if (!str2int(cmd[2], ttl_ms)) {
@@ -328,6 +367,22 @@ static void do_expire(std::vector<std::string> &cmd, std::string &out) {
     return out_int(out, node ? 1: 0);
 }
 
+/**
+ * @brief 查询条目的 TTL（生存时间）。
+ *
+ * 该函数根据命令中的参数查询条目的 TTL。如果条目不存在，返回 -2。
+ * 如果条目存在但没有设置 TTL，返回 -1。
+ * 如果条目存在且设置了 TTL，返回剩余的 TTL（以毫秒为单位）。
+ *
+ * @param cmd 包含命令及其参数的字符串向量。预期格式为：
+ *            - cmd[1]：要查询 TTL 的条目的键。
+ * @param out 用于存储输出结果的字符串。函数将结果写入此字符串。
+ *
+ * @return 无返回值。通过 `out` 参数返回操作结果。
+ *         - 如果条目不存在，返回 -2。
+ *         - 如果条目存在但没有设置 TTL，返回 -1。
+ *         - 如果条目存在且设置了 TTL，返回剩余的 TTL（以毫秒为单位）。
+ */
 static void do_ttl(std::vector<std::string> &cmd, std::string &out) {
     Entry key;
     key.key.swap(cmd[1]);
@@ -342,9 +397,10 @@ static void do_ttl(std::vector<std::string> &cmd, std::string &out) {
     if (ent->heap_idx == (size_t)-1) {
         return out_int(out, -1);
     }
-
+    //获取过期时间
     uint64_t expire_at = g_data.heap[ent->heap_idx].val;
     uint64_t now_us = get_monotonic_usec();
+    //输出（打印）剩余有效时间
     return out_int(out, expire_at > now_us ? (expire_at - now_us) / 1000 : 0);
 }
 
@@ -370,6 +426,7 @@ static void entry_del(Entry *ent) {
     const size_t k_large_container_size = 10000;
     bool too_big = false;
     switch (ent->type) {
+    //如果该条目是zset，比较该有序集合的大小，超过阈值则将删除操作放入线程池中异步处理
     case T_ZSET:
         too_big = hm_size(&ent->zset->hmap) > k_large_container_size;
         break;
@@ -504,6 +561,7 @@ static void do_zscore(std::vector<std::string> &cmd, std::string &out) {
     return znode ? out_dbl(out, znode->score) : out_nil(out);
 }
 
+//to do zrange
 // zquery zset score name offset limit
 static void do_zquery(std::vector<std::string> &cmd, std::string &out) {
     // parse args
@@ -714,6 +772,8 @@ static void state_res(Conn *conn) {
 static void connection_io(Conn *conn) {
     // waked up by poll, update the idle timer
     // by moving conn to the end of the list.
+    //dlist_detach 和 dlist_insert_before 函数用于将连接从空闲连接列表中移除
+    //并将其重新插入到列表的末尾。这是为了更新连接的空闲状态，表明该连接最近被使用过。
     conn->idle_start = get_monotonic_usec();
     dlist_detach(&conn->idle_list);
     dlist_insert_before(&g_data.idle_list, &conn->idle_list);
@@ -728,19 +788,23 @@ static void connection_io(Conn *conn) {
     }
 }
 
+//连接空闲超过5s就关闭
 const uint64_t k_idle_timeout_ms = 5 * 1000;
 
+//计算下一个超时的时间
 static uint32_t next_timer_ms() {
     uint64_t now_us = get_monotonic_usec();
     uint64_t next_us = (uint64_t)-1;
 
     // idle timers
     if (!dlist_empty(&g_data.idle_list)) {
+        //获取下一个空闲连接
         Conn *next = container_of(g_data.idle_list.next, Conn, idle_list);
         next_us = next->idle_start + k_idle_timeout_ms * 1000;
     }
 
     // ttl timers
+    //如果有 TTL 过期的条目，其过期时间早于当前的 next_us，则更新 next_us
     if (!g_data.heap.empty() && g_data.heap[0].val < next_us) {
         next_us = g_data.heap[0].val;
     }
@@ -760,13 +824,15 @@ static void conn_done(Conn *conn) {
     g_data.fd2conn[conn->fd] = NULL;
     (void)close(conn->fd);
     dlist_detach(&conn->idle_list);
-    free(conn);
+    //free(conn); 
+    //不需要手动释放，智能指针会自动释放内存
 }
 
 static bool hnode_same(HNode *lhs, HNode *rhs) {
     return lhs == rhs;
 }
 
+//处理定时器，包括空闲连接的超时处理和 TTL（Time To Live）过期条目的处理。
 static void process_timers() {
     // the extra 1000us is for the ms resolution of poll()
     uint64_t now_us = get_monotonic_usec() + 1000;
@@ -785,8 +851,10 @@ static void process_timers() {
     }
 
     // TTL timers
+    //每次处理的最大过期条目数量
     const size_t k_max_works = 2000;
     size_t nworks = 0;
+    //循环遍历全局堆 g_data.heap，直到堆为空或最小堆堆顶条目的过期时间大于当前时间。
     while (!g_data.heap.empty() && g_data.heap[0].val < now_us) {
         Entry *ent = container_of(g_data.heap[0].ref, Entry, heap_idx);
         HNode *node = hm_pop(&g_data.db, &ent->node, &hnode_same);
@@ -814,14 +882,12 @@ int main() {
     addr.sin_family = AF_INET;
     addr.sin_port = ntohs(1234);
     addr.sin_addr.s_addr = ntohl(0);    // wildcard address 0.0.0.0
-    int rv = bind(fd, (const sockaddr *)&addr, sizeof(addr));
-    if (rv) {
+    int rv = bind(fd, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
+    if (rv != 0) {
         die("bind()");
     }
 
-    // listen
-    rv = listen(fd, SOMAXCONN);
-    if (rv) {
+    if (listen(fd, SOMAXCONN) != 0) {
         die("listen()");
     }
 
@@ -841,7 +907,7 @@ int main() {
         struct pollfd pfd = {fd, POLLIN, 0};
         poll_args.push_back(pfd);
         // connection fds
-        for (Conn *conn : g_data.fd2conn) {
+        for (const auto& conn : g_data.fd2conn) {
             if (!conn) {
                 continue;
             }
@@ -853,7 +919,9 @@ int main() {
         }
 
         // poll for active fds
+        // poll 函数在没有活动的文件描述符时最多等待的时间（以毫秒为单位）。
         int timeout_ms = (int)next_timer_ms();
+        //确保在没有活动的文件描述符时，程序不会无限期阻塞。
         int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), timeout_ms);
         if (rv < 0) {
             die("poll");
@@ -862,7 +930,7 @@ int main() {
         // process active connections
         for (size_t i = 1; i < poll_args.size(); ++i) {
             if (poll_args[i].revents) {
-                Conn *conn = g_data.fd2conn[poll_args[i].fd];
+                Conn* conn = g_data.fd2conn[poll_args[i].fd].get(); // 获取原始指针
                 connection_io(conn);
                 if (conn->state == STATE_END) {
                     // client closed normally, or something bad happened.

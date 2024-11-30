@@ -73,7 +73,7 @@ static void hm_help_resizing(HMap *hmap) {
     if (hmap->ht2.size == 0) {
         // done
         free(hmap->ht2.tab);
-        hmap->ht2 = HTab{};
+        hmap->ht2 = HTab();
     }
 }
 
@@ -136,5 +136,5 @@ size_t hm_size(HMap *hmap) {
 void hm_destroy(HMap *hmap) {
     free(hmap->ht1.tab);
     free(hmap->ht2.tab);
-    *hmap = HMap{};
+    *hmap = HMap();
 }
