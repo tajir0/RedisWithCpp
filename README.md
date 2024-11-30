@@ -68,3 +68,8 @@ $ ./client pttl k
 $ ./client pttl k
 (int) -2
 ```
+## 流程图
+![图片](/doc/流程.png "流程")
+
+## 其他
+[面试问题]()
